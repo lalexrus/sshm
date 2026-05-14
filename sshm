@@ -1,0 +1,140 @@
+#!/bin/bash
+
+config="$HOME/.ssh/config"
+keepass_db="$HOME/.keepass/Database.kdbx"
+clip_cmd="wl-copy"
+
+# Кеш мастер-пароля
+runtime_dir="/run/user/$(id -u)"
+[ ! -d "$runtime_dir" ] && runtime_dir="/tmp"
+master_pass_file="$runtime_dir/keepass-master-$(id -u)"
+
+get_master_password() {
+  # Проверяем кеш
+  if [ -f "$master_pass_file" ]; then
+    local perms
+    perms=$(stat -c %a "$master_pass_file" 2>/dev/null)
+    if [ "$perms" = "600" ]; then
+      local cached_pass
+      cached_pass=$(cat "$master_pass_file" 2>/dev/null)
+      if [ -n "$cached_pass" ] && echo "$cached_pass" | keepassxc-cli ls -R "$keepass_db" &>/dev/null; then
+        echo "$cached_pass"
+        return 0
+      fi
+      rm -f "$master_pass_file"
+    else
+      rm -f "$master_pass_file"
+    fi
+  fi
+
+  # Кеша нет/невалиден - спрашиваем пароль
+  read -rsp "KeePass master password: " master_pass
+  echo
+  if ! echo "$master_pass" | keepassxc-cli ls "$keepass_db" &>/dev/null; then
+    echo "Error: Wrong master password" >&2
+    return 1
+  fi
+  printf '%s' "$master_pass" > "$master_pass_file"
+  chmod 600 "$master_pass_file"
+  echo "$master_pass"
+}
+
+copy_password() {
+  local host="$1"
+  [ -z "$clip_cmd" ] && echo "No clipboard tool found" && return
+  [ ! -f "$keepass_db" ] && echo "KeePass DB not found: $keepass_db" && return
+
+  local master_pass
+  master_pass=$(get_master_password) || return
+
+  # Функция извлечения пароля
+  get_pass() {
+    local entry="$1"
+    echo "$master_pass" | keepassxc-cli show -s "$keepass_db" "$entry" 2>/dev/null | sed -n 's/^Password: //p'
+  }
+
+  local pass=""
+  # Вариант 1: запись в корне (без слэша)
+  pass=$(get_pass "$host")
+  if [ -z "$pass" ]; then
+    # Вариант 2: с ведущим слэшем
+    pass=$(get_pass "/$host")
+  fi
+  if [ -z "$pass" ]; then
+    # Ищем через рекурсивный листинг (полные пути)
+    local entry_path
+    entry_path=$(echo "$master_pass" | keepassxc-cli ls -R "$keepass_db" 2>/dev/null | grep -E "(^|/)$host$" | head -1 | xargs)
+    if [ -n "$entry_path" ]; then
+      pass=$(get_pass "$entry_path")
+    fi
+  fi
+
+  if [ -n "$pass" ]; then
+    printf '%s' "$pass" | $clip_cmd
+    echo "Password for $host copied to clipboard (will clear in 15s)"
+    # Очистка через 15 секунд
+    (sleep 15 && printf '' | $clip_cmd) &
+  else
+    echo "Password not found for $host"
+  fi
+}
+
+ssh_include() {
+  cat "$config" "$HOME/.ssh/conf.d"/* 2>/dev/null
+}
+
+while true; do
+  groups=$(
+    ssh_include | awk '
+      /^[[:space:]]*Host[[:space:]]+/ {
+        if ($2 != "" && $2 !~ /^[*?]+$/) {
+          match($2, /^[^-]+/)
+          if (RSTART > 0) {
+            group = substr($2, RSTART, RLENGTH)
+            if (group != "") groups[group] = 1
+          }
+        }
+      }
+      END { for (g in groups) print g }
+    ' | sort
+  )
+
+  group=$(printf "All\n%s" "$groups" | sk --prompt='Select Group (Esc to exit)> ')
+  [ -z "$group" ] && exit 0
+
+  choice=$(
+    ssh_include | awk -v grp="$group" '
+      BEGIN { host=""; hn=""; user=""; port="" }
+      /^[[:space:]]*Host[[:space:]]+/ {
+        if (host != "" && host !~ /^[*?]+$/) {
+          match(host, /^[^-]+/)
+          cgrp = (RSTART > 0) ? substr(host, RSTART, RLENGTH) : host
+          if (grp == "All" || cgrp == grp) {
+            printf "%s\t%s\t%s\t%s\n", host, hn, user, port
+          }
+        }
+        host=$2; hn=""; user=""; port=""
+        next
+      }
+      tolower($1)=="hostname" { hn=$2 }
+      tolower($1)=="user"      { user=$2 }
+      tolower($1)=="port"      { port=$2 }
+      END {
+        if (host != "" && host !~ /^[*?]+$/) {
+          match(host, /^[^-]+/)
+          cgrp = (RSTART > 0) ? substr(host, RSTART, RLENGTH) : host
+          if (grp == "All" || cgrp == grp) {
+            printf "%s\t%s\t%s\t%s\n", host, hn, user, port
+          }
+        }
+      }
+    ' | column -t -s $'\t' | sk --prompt="SSH [$group]> " --bind 'esc:abort,backspace:abort'
+  )
+
+  if [ -n "$choice" ]; then
+    host=$(printf '%s\n' "$choice" | awk '{print $1}')
+    copy_password "$host"
+    ssh -F "$config" "$host"
+    break
+  fi
+done
